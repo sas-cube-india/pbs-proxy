@@ -12,7 +12,7 @@ import (
 var prebidURL = "http://localhost:8000/openrtb2/auction"
 var jioURL = "https://mercury-dsp.jio.com/jiodsp/?spid=51"
 var revAdsURL = "https://revads.djaxbidder.com:9979/Bidder_Req"
-var publisherID = "156295"
+var publisherID = "166197"
 
 var adSlotMappings = map[string]map[string]string{
         "com.truecaller": {

@@ -1,0 +1,190 @@
+package main
+
+import (
+        "bytes"
+        "encoding/json"
+        "fmt"
+        "io"
+        "log"
+        "net/http"
+        "os"
+        "time"
+)
+
+const (
+        prebidURL   = "http://localhost:8000/openrtb2/auction"
+        publisherID = "166197"
+)
+
+// Ad slot mappings based on bundle and adType
+var adSlotMappings = map[string]map[string]string{
+        "com.truecaller": {
+                "video":  "6931468",
+                "banner": "6931445",
+                "native": "6931469",
+        },
+        "com.app.sample": {
+                "banner": "AppSample_Banner@300x250",
+        },
+}
+
+// Fallback adSlots if bundle is unknown or adType mapping is missing
+var fallbackAdSlots = map[string]string{
+        "video":  "Default_Video@0x0",
+        "banner": "Default_Banner@300x250",
+        "native": "Default_Native@1x1",
+}
+
+func main() {
+        logFile, err := os.OpenFile("proxy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+        if err != nil {
+                log.Fatalf("Failed to open log file: %v", err)
+        }
+        defer logFile.Close()
+        log.SetOutput(logFile)
+        log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+        http.HandleFunc("/openrtb2/auction", proxyHandler)
+        log.Println("Proxy server started on :8080")
+        log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+        defer recoverPanic(w)
+
+        if r.Method != http.MethodPost {
+                http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+                return
+        }
+
+        requestID := time.Now().UnixNano()
+        logPrefix := fmt.Sprintf("[RequestID: %d]", requestID)
+
+        body, err := io.ReadAll(r.Body)
+        if err != nil {
+                log.Printf("%s Failed to read request body: %v", logPrefix, err)
+                http.Error(w, "Error reading request body", http.StatusInternalServerError)
+                return
+        }
+        log.Printf("%s === Incoming Request ===\n%s", logPrefix, string(body))
+
+        var req map[string]interface{}
+        if err := json.Unmarshal(body, &req); err != nil {
+                log.Printf("%s Invalid JSON body", logPrefix)
+                http.Error(w, "Invalid JSON", http.StatusBadRequest)
+                return
+        }
+
+        injectPubmaticConfig(req, logPrefix)
+
+        modifiedBody, err := json.Marshal(req)
+        if err != nil {
+                log.Printf("%s Failed to marshal modified request: %v", logPrefix, err)
+                http.Error(w, "Failed to encode request", http.StatusInternalServerError)
+                return
+        }
+        log.Printf("%s === Modified Request ===\n%s", logPrefix, string(modifiedBody))
+
+        resp, err := http.Post(prebidURL, "application/json", bytes.NewBuffer(modifiedBody))
+        if err != nil {
+                log.Printf("%s Failed to contact Prebid Server: %v", logPrefix, err)
+                http.Error(w, "Prebid Server Error", http.StatusBadGateway)
+                return
+        }
+        defer resp.Body.Close()
+
+        responseBody, err := io.ReadAll(resp.Body)
+        if err != nil {
+                log.Printf("%s Failed to read Prebid response: %v", logPrefix, err)
+                http.Error(w, "Failed to read response", http.StatusInternalServerError)
+                return
+        }
+
+        log.Printf("%s === Response from Prebid Server ===\n%s", logPrefix, string(responseBody))
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(resp.StatusCode)
+        w.Write(responseBody)
+}
+
+func injectPubmaticConfig(req map[string]interface{}, logPrefix string) {
+        app, ok := req["app"].(map[string]interface{})
+        if !ok {
+                log.Printf("%s No 'app' field found in request", logPrefix)
+                return
+        }
+
+        bundle, _ := app["bundle"].(string)
+        if bundle == "" {
+                bundle = "UNKNOWN_BUNDLE"
+                log.Printf("%s No bundle found in request. Using 'UNKNOWN_BUNDLE'", logPrefix)
+        } else {
+                log.Printf("%s Bundle found: %s", logPrefix, bundle)
+        }
+
+        impList, ok := req["imp"].([]interface{})
+        if !ok {
+                log.Printf("%s No 'imp' list in request", logPrefix)
+                return
+        }
+
+        for i, item := range impList {
+                imp, ok := item.(map[string]interface{})
+                if !ok {
+                        continue
+                }
+
+                adType := ""
+                if _, ok := imp["video"]; ok {
+                        adType = "video"
+                } else if _, ok := imp["banner"]; ok {
+                        adType = "banner"
+                } else if _, ok := imp["native"]; ok {
+                        adType = "native"
+                }
+
+                if adType == "" {
+                        log.Printf("%s Could not detect adType for imp[%d]", logPrefix, i)
+                        continue
+                }
+
+                adSlot := adSlotMappings[bundle][adType]
+                if adSlot == "" {
+                        adSlot = fallbackAdSlots[adType]
+                        log.Printf("%s [Fallback] No mapping found for bundle '%s' and adType '%s'. Using fallback adSlot '%s'", logPrefix, bundle, adType, adSlot)
+                } else {
+                        log.Printf("%s Mapping found: bundle='%s', adType='%s' -> adSlot='%s'", logPrefix, bundle, adType, adSlot)
+                }
+
+                ext := getOrCreateMap(imp, "ext")
+                prebid := getOrCreateMap(ext, "prebid")
+                bidder := getOrCreateMap(prebid, "bidder")
+
+                bidder["pubmatic"] = map[string]interface{}{
+                        "publisherId": publisherID,
+                        "adSlot":      adSlot,
+                }
+
+                prebid["bidder"] = bidder
+                ext["prebid"] = prebid
+                imp["ext"] = ext
+                impList[i] = imp
+        }
+
+        req["imp"] = impList
+}
+
+func getOrCreateMap(m map[string]interface{}, key string) map[string]interface{} {
+        val, ok := m[key].(map[string]interface{})
+        if !ok {
+                val = make(map[string]interface{})
+                m[key] = val
+        }
+        return val
+}
+
+func recoverPanic(w http.ResponseWriter) {
+        if r := recover(); r != nil {
+                log.Printf("Recovered from panic: %v", r)
+                http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+        }
+}
